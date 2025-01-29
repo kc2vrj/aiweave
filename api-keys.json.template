@@ -1,0 +1,17 @@
+{
+  "Anthropic_API_KEY": "your-anthropic-key",
+  "OpenAI_API_KEY": "your-openai-key",
+  "Google_API_KEY": "your-google-key",
+  "Groq_API_KEY": "your-groq-key",
+  "HuggingFace_API_KEY": "your-huggingface-key",
+  "OpenRouter_API_KEY": "your-openrouter-key",
+  "Deepseek_API_KEY": "your-deepseek-key",
+  "Mistral_API_KEY": "your-mistral-key",
+  "OpenAILike_API_KEY": "your-openailike-key",
+  "Together_API_KEY": "your-together-key",
+  "xAI_API_KEY": "your-xai-key",
+  "Perplexity_API_KEY": "your-perplexity-key",
+  "Cohere_API_KEY": "your-cohere-key",
+  "AzureOpenAI_API_KEY": "your-azure-key",
+  "AmazonBedrock_API_KEY": "your-bedrock-key"
+}

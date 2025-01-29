@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+import os
+import json
+import asyncio
+import requests
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+from dotenv import load_dotenv
+from bs4 import BeautifulSoup
+import re
+from typing import Optional, Dict, Any
+
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+from groq import AsyncGroq
+from openai import AsyncOpenAI
+from anthropic import AsyncAnthropic
+import google.generativeai as genai
+from huggingface_hub import AsyncInferenceClient
+from mistralai.client import MistralClient  # Updated import
+
+load_dotenv()
+
+class AIProvider:
+    def __init__(self, api_keys: Dict[str, str]):
+        self.api_keys = api_keys
+        self.clients = {}
+        self._initialize_clients()
+
+    def _initialize_clients(self):
+        """Initialize available AI clients based on API keys."""
+        if self.api_keys.get("Groq_API_KEY"):
+            try:
+                self.clients["groq"] = AsyncGroq(api_key=self.api_keys["Groq_API_KEY"])
+                print("✓ Initialized Groq client")
+            except Exception as e:
+                print(f"✗ Failed to initialize Groq: {e}")
+        
+        if self.api_keys.get("OpenAI_API_KEY"):
+            try:
+                self.clients["openai"] = AsyncOpenAI(api_key=self.api_keys["OpenAI_API_KEY"])
+                print("✓ Initialized OpenAI client")
+            except Exception as e:
+                print(f"✗ Failed to initialize OpenAI: {e}")
+        
+        if self.api_keys.get("Anthropic_API_KEY"):
+            try:
+                self.clients["anthropic"] = AsyncAnthropic(api_key=self.api_keys["Anthropic_API_KEY"])
+                print("✓ Initialized Anthropic client")
+            except Exception as e:
+                print(f"✗ Failed to initialize Anthropic: {e}")
+        
+        if self.api_keys.get("Google_API_KEY"):
+            try:
+                genai.configure(api_key=self.api_keys["Google_API_KEY"])
+                self.clients["google"] = genai
+                print("✓ Initialized Google client")
+            except Exception as e:
+                print(f"✗ Failed to initialize Google: {e}")
+        
+        if self.api_keys.get("HuggingFace_API_KEY"):
+            try:
+                self.clients["huggingface"] = AsyncInferenceClient(token=self.api_keys["HuggingFace_API_KEY"])
+                print("✓ Initialized HuggingFace client")
+            except Exception as e:
+                print(f"✗ Failed to initialize HuggingFace: {e}")
+        
+        if self.api_keys.get("Mistral_API_KEY"):
+            try:
+                self.clients["mistral"] = MistralClient(api_key=self.api_keys["Mistral_API_KEY"])
+                print("✓ Initialized Mistral client")
+            except Exception as e:
+                print(f"✗ Failed to initialize Mistral: {e}")
+        
+        if not self.clients:
+            print("⚠️ Warning: No AI providers were successfully initialized")
+
+    async def get_completion(self, prompt: str, provider: Optional[str] = None) -> str:
+        """Get completion from available AI provider."""
+        if not provider:
+            provider = next(iter(self.clients), None)
+            if not provider:
+                raise ValueError("No AI providers available")
+        
+        if provider not in self.clients:
+            raise ValueError(f"Provider {provider} not available")
+
+        client = self.clients[provider]
+        
+        try:
+            if provider == "groq":
+                response = await client.chat.completions.create(
+                    model="mixtral-8x7b-32768",
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                return response.choices[0].message.content
+            
+            elif provider == "openai":
+                response = await client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                return response.choices[0].message.content
+            
+            elif provider == "anthropic":
+                response = await client.messages.create(
+                    model="claude-3-opus-20240229",
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                return response.content[0].text
+            
+            elif provider == "google":
+                model = genai.GenerativeModel('gemini-pro')
+                response = await model.generate_content(prompt)
+                return response.text
+            
+            elif provider == "huggingface":
+                response = await client.text_generation(prompt, model="mistralai/Mistral-7B-Instruct-v0.2")
+                return response[0]["generated_text"]
+            
+            elif provider == "mistral":
+                # Updated Mistral completion
+                response = client.chat(
+                    model="mistral-large-latest",
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                return response.choices[0].message.content
+            
+        except Exception as e:
+            print(f"Error with {provider}: {e}")
+            # Try next available provider
+            remaining_providers = list(self.clients.keys())
+            remaining_providers.remove(provider)
+            if remaining_providers:
+                return await self.get_completion(prompt, remaining_providers[0])
+            raise
+
+# [Rest of the code remains the same...]
+
+class SiteCrawler:
+    def __init__(self, output_dir, ai_provider: AIProvider, max_concurrent=5):
+        self.output_dir = output_dir
+        self.max_concurrent = max_concurrent
+        self.ai_provider = ai_provider
+        self.crawled_urls = set()
+        self.failed_urls = set()
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    def get_safe_filename(self, url: str) -> str:
+        """Create a safe filename from URL."""
+        path = urlparse(url).path.strip('/')
+        if not path:
+            return 'index.md'
+        
+        safe_name = re.sub(r'[^a-zA-Z0-9]', '-', path)
+        safe_name = re.sub(r'-+', '-', safe_name)
+        safe_name = safe_name.strip('-')
+        
+        return f"{safe_name}.md"
+
+    async def process_content(self, content: str, url: str) -> str:
+        """Process content using AI provider."""
+        prompt = f"""Please analyze this content and provide a structured markdown document with:
+        1. A clear title
+        2. A brief summary
+        3. The main content, properly formatted
+        
+        Content to analyze:
+        {content[:2000]}...
+        """
+        
+        try:
+            processed_content = await self.ai_provider.get_completion(prompt)
+            return processed_content
+        except Exception as e:
+            print(f"Error processing content: {e}")
+            return content
+
+    def save_markdown(self, url: str, content: str):
+        """Save content as markdown file."""
+        filename = self.get_safe_filename(url)
+        filepath = os.path.join(self.output_dir, filename)
+        
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(f"---\nurl: {url}\n---\n\n")
+                f.write(content)
+            print(f"✓ Saved: {filename}")
+        except Exception as e:
+            print(f"✗ Failed to save {filename}: {e}")
+
+    def is_same_domain(self, base_url: str, url: str) -> bool:
+        """Check if URL belongs to the same domain."""
+        base_domain = urlparse(base_url).netloc
+        url_domain = urlparse(url).netloc
+        return base_domain == url_domain
+
+    def extract_links(self, base_url: str, html_content: str) -> set:
+        """Extract all links from HTML content."""
+        soup = BeautifulSoup(html_content, 'html.parser')
+        links = set()
+        
+        for anchor in soup.find_all('a', href=True):
+            href = anchor['href']
+            absolute_url = urljoin(base_url, href)
+            
+            if not absolute_url.startswith(('http://', 'https://')):
+                continue
+            if not self.is_same_domain(base_url, absolute_url):
+                continue
+            
+            url_parts = list(urlparse(absolute_url))
+            url_parts[5] = ''
+            clean_url = url_parts[0] + '://' + url_parts[1] + url_parts[2]
+            
+            links.add(clean_url)
+        
+        return links
+
+    async def crawl_url(self, url: str, base_url: str):
+        """Crawl a URL and its links."""
+        if url in self.crawled_urls or url in self.failed_urls:
+            return
+
+        async with self.semaphore:
+            print(f"→ Crawling: {url}")
+            
+            browser_config = BrowserConfig(
+                headless=True,
+                verbose=False,
+                extra_args=["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox"],
+            )
+            crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
+            
+            crawler = AsyncWebCrawler(config=browser_config)
+            await crawler.start()
+            
+            try:
+                result = await crawler.arun(url=url, config=crawl_config, session_id="session1")
+                
+                if result.success:
+                    processed_content = await self.process_content(result.markdown_v2.raw_markdown, url)
+                    self.save_markdown(url, processed_content)
+                    self.crawled_urls.add(url)
+                    
+                    new_links = self.extract_links(url, result.html)
+                    tasks = []
+                    for link in new_links:
+                        if link not in self.crawled_urls and link not in self.failed_urls:
+                            tasks.append(self.crawl_url(link, base_url))
+                    
+                    if tasks:
+                        await asyncio.gather(*tasks)
+                else:
+                    print(f"✗ Failed to crawl: {url}")
+                    self.failed_urls.add(url)
+            except Exception as e:
+                print(f"✗ Error crawling {url}: {e}")
+                self.failed_urls.add(url)
+            finally:
+                await crawler.close()
+
+    async def crawl_site(self, start_url: str):
+        """Start crawling from a URL."""
+        print(f"Starting crawl from: {start_url}")
+        await self.crawl_url(start_url, start_url)
+        
+        print("\nCrawl completed!")
+        print(f"Successfully crawled: {len(self.crawled_urls)} pages")
+        print(f"Failed to crawl: {len(self.failed_urls)} pages")
+
+async def main():
+    parser = argparse.ArgumentParser(description='Multi-AI provider site crawler')
+    parser.add_argument('url', help='Starting URL to crawl')
+    parser.add_argument('--output-dir', default='crawled_docs', help='Output directory')
+    parser.add_argument('--max-concurrent', type=int, default=5, help='Maximum concurrent crawls')
+    parser.add_argument('--ai-provider', help='Preferred AI provider (optional)')
+    parser.add_argument('--config', default='api-keys.json', help='API keys configuration file')
+    args = parser.parse_args()
+
+    # Load API keys
+    try:
+        with open(args.config) as f:
+            api_keys = json.load(f)
+    except FileNotFoundError:
+        print(f"Config file {args.config} not found")
+        return
+
+    # Initialize AI provider
+    ai_provider = AIProvider(api_keys)
+    
+    # Create and run crawler
+    crawler = SiteCrawler(args.output_dir, ai_provider, args.max_concurrent)
+    await crawler.crawl_site(args.url)
+
+if __name__ == "__main__":
+    import argparse
+    asyncio.run(main())

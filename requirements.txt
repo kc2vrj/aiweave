@@ -1,0 +1,11 @@
+groq>=0.3.0
+openai>=1.0.0
+#anthropic>=0.8.0
+google-generativeai>=0.3.0
+huggingface-hub>=0.20.0
+#deepseek-ai>=0.1.0
+mistralai>=0.0.8
+beautifulsoup4>=4.12.0
+crawl4ai>=0.1.0
+python-dotenv>=1.0.0
+requests>=2.31.0
