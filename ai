@@ -10,80 +10,158 @@ import argparse
 from typing import Optional, Dict, Any, List, Set
 import itertools
 import gc
+import re
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 from groq import AsyncGroq
 from openai import AsyncOpenAI
 from bs4 import BeautifulSoup
+from huggingface_hub import HfApi
 
 load_dotenv()
+
+class RateLimitError(Exception):
+    def __init__(self, wait_time, message="Rate limit exceeded"):
+        self.wait_time = wait_time
+        self.message = message
+        super().__init__(self.message)
+
+class APIManager:
+    def __init__(self):
+        self.groq_rate_limit = 500000  # Default rate limit
+        self.groq_used = 0
+        self.last_reset_time = time.time()
+        self.backoff_time = 1  # Initial backoff time in seconds
+        
+    async def call_api(self, api_func, *args, **kwargs):
+        while True:
+            try:
+                return await api_func(*args, **kwargs)
+            except Exception as e:
+                error_msg = str(e)
+                if "rate_limit" in error_msg.lower():
+                    # Extract wait time from error message
+                    wait_time = self._extract_wait_time(error_msg)
+                    if wait_time:
+                        print(f"Rate limit hit, waiting {wait_time} seconds")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    
+                    # If we can't extract wait time, use exponential backoff
+                    print(f"Using exponential backoff: {self.backoff_time} seconds")
+                    await asyncio.sleep(self.backoff_time)
+                    self.backoff_time *= 2  # Exponential backoff
+                    continue
+                
+                # For non-rate-limit errors, raise them
+                raise
+
+    def _extract_wait_time(self, error_msg):
+        try:
+            # Look for time patterns like "1m40.3838s" or similar
+            match = re.search(r"try again in (\d+)m([\d.]+)s", error_msg)
+            if match:
+                minutes, seconds = match.groups()
+                return float(minutes) * 60 + float(seconds)
+            return None
+        except:
+            return None
+
+    def reset_backoff(self):
+        self.backoff_time = 1
 
 class MultiAIProvider:
     def __init__(self, api_keys: Dict[str, str]):
         self.api_keys = api_keys
         self.clients = {}
+        self.rate_limited_until = {}
         self.initialize_clients()
-        self.provider_cycle = itertools.cycle(self.clients.keys())
-        self.current_provider = next(self.provider_cycle)
-        self.request_counts = {provider: 0 for provider in self.clients.keys()}
-        self.last_request_time = {provider: 0 for provider in self.clients.keys()}
         self.min_delay = 0.1
+        self.api_manager = APIManager()
 
     def initialize_clients(self):
         if self.api_keys.get("Groq_API_KEY"):
-            try:
-                self.clients["groq"] = AsyncGroq(api_key=self.api_keys["Groq_API_KEY"])
-                print("✓ Initialized Groq client")
-            except Exception as e:
-                print(f"✗ Failed to initialize Groq: {e}")
+            self.clients["groq"] = AsyncGroq(api_key=self.api_keys["Groq_API_KEY"])
+            print("✓ Initialized Groq client")
+            
+        if self.api_keys.get("HUGGINGFACE_API_KEY"):
+            from huggingface_hub import HfApi
+            self.clients["huggingface"] = HfApi(token=self.api_keys["HUGGINGFACE_API_KEY"])
+            print("✓ Initialized Hugging Face client")
 
-        if self.api_keys.get("OpenAI_API_KEY"):
-            try:
-                self.clients["openai"] = AsyncOpenAI(api_key=self.api_keys["OpenAI_API_KEY"])
-                print("✓ Initialized OpenAI client")
-            except Exception as e:
-                print(f"✗ Failed to initialize OpenAI: {e}")
+        if self.api_keys.get("OPENAI_API_KEY"):
+            self.clients["openai"] = AsyncOpenAI(api_key=self.api_keys["OPENAI_API_KEY"])
+            print("✓ Initialized OpenAI client")
 
-    def next_provider(self):
-        self.current_provider = next(self.provider_cycle)
-        current_time = time.time()
-        delay_needed = self.min_delay - (current_time - self.last_request_time[self.current_provider])
-        if delay_needed > 0:
-            time.sleep(delay_needed)
-        self.last_request_time[self.current_provider] = current_time
-        return self.current_provider
-
-    async def get_completion(self, prompt: str, provider: Optional[str] = None) -> str:
-        if not provider:
-            provider = self.current_provider
-            self.next_provider()
-
-        if provider not in self.clients:
-            raise ValueError(f"Provider {provider} not available")
-
-        client = self.clients[provider]
-        self.request_counts[provider] += 1
+    async def get_completion(self, prompt: str) -> str:
+        """Get completion with improved fallback logic."""
+        now = time.time()
+        available_providers = []
         
-        try:
-            if provider == "groq":
-                response = await client.chat.completions.create(
-                    model="mixtral-8x7b-32768",
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                return response.choices[0].message.content
-            
-            elif provider == "openai":
-                response = await client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                return response.choices[0].message.content
-            
-        except Exception as e:
-            print(f"Error with {provider}: {e}")
-            other_provider = next(p for p in self.clients.keys() if p != provider)
-            print(f"Falling back to {other_provider}")
-            return await self.get_completion(prompt, other_provider)
+        # Get list of available non-rate-limited providers
+        for provider in ["groq", "huggingface", "openai"]:
+            if provider not in self.clients:
+                continue
+            if provider in self.rate_limited_until:
+                if now < self.rate_limited_until[provider]:
+                    print(f"Skipping {provider} - rate limited for {int(self.rate_limited_until[provider] - now)} more seconds")
+                    continue
+                else:
+                    del self.rate_limited_until[provider]
+            available_providers.append(provider)
+
+        if not available_providers:
+            wait_time = min(self.rate_limited_until.values()) - now
+            raise Exception(f"All providers are rate limited. Try again in {int(wait_time)} seconds")
+
+        last_error = None
+        for provider in available_providers:
+            try:
+                if provider == "groq":
+                    response = await self.clients[provider].chat.completions.create(
+                        model="mixtral-8x7b-32768",
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    return response.choices[0].message.content
+
+                elif provider == "huggingface":
+                    response = await self.clients[provider].text_generation(
+                        model="mistralai/Mixtral-8x7B-Instruct-v0.1",
+                        inputs=prompt,
+                        parameters={"max_length": 2000, "temperature": 0.7}
+                    )
+                    return response[0]["generated_text"]
+                
+                elif provider == "openai":
+                    response = await self.clients[provider].chat.completions.create(
+                        model="gpt-3.5-turbo",
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    return response.choices[0].message.content
+
+            except Exception as e:
+                error_msg = str(e).lower()
+                last_error = e
+                
+                if "rate" in error_msg and "limit" in error_msg:
+                    # Extract wait time from error message if available
+                    wait_time = 60  # Default 60 seconds
+                    match = re.search(r"try again in (\d+)m(\d+.\d+)s", error_msg)
+                    if match:
+                        minutes, seconds = match.groups()
+                        wait_time = int(minutes) * 60 + float(seconds)
+                    
+                    print(f"Rate limit hit for {provider}, waiting {wait_time} seconds")
+                    self.rate_limited_until[provider] = now + wait_time
+                    continue
+                else:
+                    print(f"Error with {provider}: {str(e)}")
+                    continue
+
+        if last_error:
+            raise Exception(f"All available providers failed. Last error: {str(last_error)}")
+        else:
+            raise Exception("No providers available")
 
     def print_stats(self):
         print("\nAI Provider Usage Statistics:")
@@ -151,27 +229,63 @@ class FastSiteCrawler:
             print(f"Error processing content: {e}")
             return content
 
-    def save_markdown(self, url: str, content: str):
-        # Extract the base URL to use as a folder name
-        base_url = urlparse(url).netloc
-        path = urlparse(url).path.strip('/')
-        filename = path if path else 'index'
-        filename = filename.replace('/', '-') + '.md'
-        
-        # Create a directory for the base URL
-        base_dir = os.path.join(self.output_dir, base_url)
-        Path(base_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Save the markdown file in the base URL directory
-        filepath = os.path.join(base_dir, filename)
-        
+    def save_markdown(self, url: str, content: str) -> None:
+        """Save the markdown content to a file with proper subdirectory structure."""
         try:
+            # Parse the URL
+            parsed_url = urlparse(url)
+            path_parts = parsed_url.path.strip('/').split('/')
+            
+            # Create directory structure
+            if parsed_url.netloc == 'github.com':
+                # For GitHub URLs, create subdirs for owner/repo
+                if len(path_parts) >= 2:
+                    # Create directory structure: domain/owner/repo/
+                    subdir = os.path.join(self.output_dir, parsed_url.netloc, *path_parts[:2])
+                    
+                    # Create filename from remaining path parts
+                    if len(path_parts) > 2:
+                        filename = '-'.join(path_parts[2:])
+                    else:
+                        filename = 'index'
+                else:
+                    # Fallback for short paths
+                    subdir = os.path.join(self.output_dir, parsed_url.netloc)
+                    filename = path_parts[0] if path_parts else 'index'
+            else:
+                # For other URLs, use domain as subdir
+                subdir = os.path.join(self.output_dir, parsed_url.netloc)
+                if path_parts:
+                    filename = '-'.join(path_parts)
+                else:
+                    filename = 'index'
+            
+            # Clean the filename
+            filename = re.sub(r'[^\w\-\.]', '-', filename)
+            filename = re.sub(r'-+', '-', filename).strip('-')
+            
+            # Ensure the filename ends with .md
+            if not filename.endswith('.md'):
+                filename += '.md'
+            
+            # Create the full file path
+            filepath = os.path.join(subdir, filename)
+            
+            # Create all necessary directories
+            os.makedirs(subdir, exist_ok=True)
+            
+            print(f"Saving file to: {filepath}")
+            
+            # Write the content with YAML frontmatter
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(f"---\nurl: {url}\n---\n\n")
                 f.write(content)
-            print(f"✓ Saved: {filename} in {base_url}")
+            
+            print(f"✓ Saved: {filename}")
+            
         except Exception as e:
-            print(f"✗ Failed to save {filename}: {e}")
+            print(f"Error saving file: {e}")
+            raise
 
     async def process_page(self, url: str, crawler: AsyncWebCrawler) -> Set[str]:
         """Process a single page and return new links."""
@@ -214,11 +328,33 @@ class FastSiteCrawler:
             print(f"✗ Error processing {url}: {e}")
             return set()
 
-    async def crawl_site(self, start_url: str):
+    async def crawl_site(self, start_url: str, github_only: bool = False):
         print(f"Starting crawl from: {start_url}")
         start_time = time.time()
+        base_repo_url = None
         
-        # Initialize URL set
+        # Handle GitHub-specific configuration
+        if github_only:
+            parsed_url = urlparse(start_url)
+            path_parts = parsed_url.path.strip('/').split('/')
+            if len(path_parts) >= 2:
+                # Get owner/repo for GitHub URLs
+                owner, repo = path_parts[0], path_parts[1]
+                project_name = f"{owner}/{repo}"
+                base_repo_url = f"https://{parsed_url.netloc}/{owner}/{repo}"
+                
+                # Create project-specific directory
+                self.output_dir = os.path.join(self.output_dir, project_name)
+                os.makedirs(self.output_dir, exist_ok=True)
+                
+                print(f"GitHub project: {project_name}")
+                print(f"Output directory: {self.output_dir}")
+                print(f"Base repository URL: {base_repo_url}")
+            else:
+                print("Error: Invalid GitHub URL format")
+                return
+
+        # Initialize URL set and start crawling
         self.to_crawl.add(start_url)
         
         try:
@@ -226,42 +362,45 @@ class FastSiteCrawler:
                 # Create a new crawler for each batch
                 crawler = AsyncWebCrawler(config=self.browser_config)
                 await crawler.start()
-                
+
                 try:
                     # Process current batch
                     current_batch = set(itertools.islice(self.to_crawl, self.max_concurrent))
                     self.to_crawl -= current_batch
-                    
+
                     # Create tasks for the batch
                     tasks = [self.process_page(url, crawler) for url in current_batch]
                     results = await asyncio.gather(*tasks, return_exceptions=True)
-                    
+
                     # Add new links to crawl
                     for result in results:
                         if isinstance(result, set):
-                            new_links = result - self.crawled_urls - self.failed_urls
+                            if github_only:
+                                new_links = {link for link in result if link.startswith(base_repo_url)}
+                            else:
+                                new_links = result - self.crawled_urls - self.failed_urls
                             self.to_crawl.update(new_links)
-                    
+
                     # Progress report
                     print(f"\nProgress: {len(self.crawled_urls)} crawled, "
                           f"{len(self.to_crawl)} pending, "
                           f"{len(self.failed_urls)} failed")
-                    
+
                 finally:
                     await crawler.close()
                     gc.collect()  # Force garbage collection
-            
+
             # Final report
             end_time = time.time()
             duration = end_time - start_time
-            
+
             print("\nCrawl completed!")
             print(f"Successfully crawled: {len(self.crawled_urls)} pages")
             print(f"Failed to crawl: {len(self.failed_urls)} pages")
             print(f"Total time: {duration:.2f} seconds")
             if self.crawled_urls:
                 print(f"Average time per page: {duration/len(self.crawled_urls):.2f} seconds")
-            
+
             if self.failed_urls:
                 print("\nFailed URLs:")
                 for url in self.failed_urls:
@@ -278,7 +417,12 @@ async def main():
     parser.add_argument('--output-dir', default='crawled_docs', help='Output directory')
     parser.add_argument('--max-concurrent', type=int, default=5, help='Maximum concurrent crawls')
     parser.add_argument('--config', default='api-keys.json', help='API keys configuration file')
+    parser.add_argument('--github-only', action='store_true', help='Crawl only a GitHub repository')
     args = parser.parse_args()
+
+    if args.github_only and 'github.com' not in urlparse(args.url).netloc:
+        print("Error: The URL must be a GitHub repository when using --github-only flag.")
+        return
 
     try:
         with open(args.config) as f:
@@ -289,7 +433,7 @@ async def main():
 
     ai_provider = MultiAIProvider(api_keys)
     crawler = FastSiteCrawler(args.output_dir, ai_provider, args.max_concurrent)
-    await crawler.crawl_site(args.url)
+    await crawler.crawl_site(args.url, args.github_only)
 
 if __name__ == "__main__":
     asyncio.run(main())

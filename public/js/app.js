@@ -93,26 +93,33 @@ function downloadCurrent() {
  * Start the crawler for a given URL
  */
 async function startCrawl() {
-    const urlInput = document.getElementById('urlInput');
+    const urlInput = document.getElementById('urlInput').value;
+    const githubOnly = document.getElementById('githubOnlyCheckbox').checked;
     const statusDiv = document.getElementById('crawlStatus');
-    const url = urlInput.value.trim();
-    
-    if (!url) {
-        alert('Please enter a URL');
+
+    if (!urlInput) {
+        alert('Please enter a URL to crawl.');
         return;
     }
-    
+
     try {
         // Clear previous status and show starting message
         statusDiv.textContent = 'Starting crawler...\n';
-        
+
         const response = await fetch('/api/crawl', {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json',
+                'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ url })
+            body: JSON.stringify({
+                url: urlInput,
+                githubOnly: githubOnly
+            })
         });
+
+        if (!response.ok) {
+            throw new Error('Failed to start crawl.');
+        }
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
@@ -121,10 +128,11 @@ async function startCrawl() {
         while (true) {
             const { value, done } = await reader.read();
             if (done) break;
-            
+
             const text = decoder.decode(value);
+            console.log('Received chunk:', text);  
             const lines = text.split('\n');
-            
+
             lines.forEach(line => {
                 if (line.startsWith('data: ')) {
                     try {
@@ -140,11 +148,13 @@ async function startCrawl() {
             });
         }
 
+        console.log('Crawl started successfully.');
+
         // Reload file list after crawl completes
         await loadFiles();
-        
+
     } catch (error) {
-        console.error('Error starting crawler:', error);
+        console.error('Error starting crawl:', error);
         statusDiv.textContent += `Error: ${error.message}\n`;
     }
 }
