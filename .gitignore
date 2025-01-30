@@ -1,4 +1,6 @@
 api-keys.json
 .env
 node_modules/
+crawled_docs/
+crawled_docs_backup/
 *.log
