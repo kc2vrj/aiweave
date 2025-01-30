@@ -20,12 +20,20 @@ app.get('/', (req, res) => {
 // Get list of markdown files
 app.get('/api/files', async (req, res) => {
     try {
-        const files = await fs.readdir('./crawled_docs');
-        const markdownFiles = files.filter(file => file.endsWith('.md'));
-        const fileDetails = await Promise.all(markdownFiles.map(async (file) => {
-            const stats = await fs.stat(path.join('./crawled_docs', file));
+        const getFilesRecursively = async (dir) => {
+            const dirents = await fs.readdir(dir, { withFileTypes: true });
+            const files = await Promise.all(dirents.map((dirent) => {
+                const res = path.resolve(dir, dirent.name);
+                return dirent.isDirectory() ? getFilesRecursively(res) : res;
+            }));
+            return Array.prototype.concat(...files);
+        };
+
+        const allFiles = await getFilesRecursively('./crawled_docs');
+        const fileDetails = await Promise.all(allFiles.map(async (file) => {
+            const stats = await fs.stat(file);
             return {
-                name: file,
+                name: path.relative('./crawled_docs', file),
                 size: stats.size,
                 created: stats.birthtime
             };
