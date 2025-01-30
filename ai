@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+import os
+import json
+import asyncio
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+from dotenv import load_dotenv
+import time
+import argparse
+from typing import Optional, Dict, Any, List, Set
+import itertools
+import gc
+
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+from groq import AsyncGroq
+from openai import AsyncOpenAI
+from bs4 import BeautifulSoup
+
+load_dotenv()
+
+class MultiAIProvider:
+    def __init__(self, api_keys: Dict[str, str]):
+        self.api_keys = api_keys
+        self.clients = {}
+        self.initialize_clients()
+        self.provider_cycle = itertools.cycle(self.clients.keys())
+        self.current_provider = next(self.provider_cycle)
+        self.request_counts = {provider: 0 for provider in self.clients.keys()}
+        self.last_request_time = {provider: 0 for provider in self.clients.keys()}
+        self.min_delay = 0.1
+
+    def initialize_clients(self):
+        if self.api_keys.get("Groq_API_KEY"):
+            try:
+                self.clients["groq"] = AsyncGroq(api_key=self.api_keys["Groq_API_KEY"])
+                print("✓ Initialized Groq client")
+            except Exception as e:
+                print(f"✗ Failed to initialize Groq: {e}")
+
+        if self.api_keys.get("OpenAI_API_KEY"):
+            try:
+                self.clients["openai"] = AsyncOpenAI(api_key=self.api_keys["OpenAI_API_KEY"])
+                print("✓ Initialized OpenAI client")
+            except Exception as e:
+                print(f"✗ Failed to initialize OpenAI: {e}")
+
+    def next_provider(self):
+        self.current_provider = next(self.provider_cycle)
+        current_time = time.time()
+        delay_needed = self.min_delay - (current_time - self.last_request_time[self.current_provider])
+        if delay_needed > 0:
+            time.sleep(delay_needed)
+        self.last_request_time[self.current_provider] = current_time
+        return self.current_provider
+
+    async def get_completion(self, prompt: str, provider: Optional[str] = None) -> str:
+        if not provider:
+            provider = self.current_provider
+            self.next_provider()
+
+        if provider not in self.clients:
+            raise ValueError(f"Provider {provider} not available")
+
+        client = self.clients[provider]
+        self.request_counts[provider] += 1
+        
+        try:
+            if provider == "groq":
+                response = await client.chat.completions.create(
+                    model="mixtral-8x7b-32768",
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                return response.choices[0].message.content
+            
+            elif provider == "openai":
+                response = await client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                return response.choices[0].message.content
+            
+        except Exception as e:
+            print(f"Error with {provider}: {e}")
+            other_provider = next(p for p in self.clients.keys() if p != provider)
+            print(f"Falling back to {other_provider}")
+            return await self.get_completion(prompt, other_provider)
+
+    def print_stats(self):
+        print("\nAI Provider Usage Statistics:")
+        for provider, count in self.request_counts.items():
+            print(f"{provider}: {count} requests")
+
+class FastSiteCrawler:
+    def __init__(self, output_dir, ai_provider: MultiAIProvider, max_concurrent=5):
+        self.output_dir = output_dir
+        self.max_concurrent = max_concurrent
+        self.ai_provider = ai_provider
+        self.crawled_urls = set()
+        self.failed_urls = set()
+        self.to_crawl = set()
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+        # Optimized browser configuration
+        self.browser_config = BrowserConfig(
+            headless=True,
+            verbose=False,
+            extra_args=[
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-extensions",
+            ],
+        )
+
+    def extract_links(self, base_url: str, html_content: str) -> Set[str]:
+        """Extract links from HTML content."""
+        links = set()
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            base_domain = urlparse(base_url).netloc
+            
+            for a in soup.find_all('a', href=True):
+                href = a['href']
+                full_url = urljoin(base_url, href)
+                parsed = urlparse(full_url)
+                
+                if (parsed.netloc == base_domain and 
+                    parsed.scheme in ('http', 'https')):
+                    links.add(full_url.split('#')[0])  # Remove fragments
+            
+            del soup  # Help garbage collection
+            gc.collect()  # Force garbage collection
+            return links
+        except Exception as e:
+            print(f"Error extracting links: {e}")
+            return set()
+
+    async def process_content(self, content: str, url: str) -> str:
+        prompt = f"""Provide a markdown document with:
+        1. Title
+        2. Brief summary (2-3 sentences)
+        3. Main content (keep structure)
+        
+        Content: {content[:1500]}..."""
+        
+        try:
+            return await self.ai_provider.get_completion(prompt)
+        except Exception as e:
+            print(f"Error processing content: {e}")
+            return content
+
+    def save_markdown(self, url: str, content: str):
+        # Extract the base URL to use as a folder name
+        base_url = urlparse(url).netloc
+        path = urlparse(url).path.strip('/')
+        filename = path if path else 'index'
+        filename = filename.replace('/', '-') + '.md'
+        
+        # Create a directory for the base URL
+        base_dir = os.path.join(self.output_dir, base_url)
+        Path(base_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Save the markdown file in the base URL directory
+        filepath = os.path.join(base_dir, filename)
+        
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(f"---\nurl: {url}\n---\n\n")
+                f.write(content)
+            print(f"✓ Saved: {filename} in {base_url}")
+        except Exception as e:
+            print(f"✗ Failed to save {filename}: {e}")
+
+    async def process_page(self, url: str, crawler: AsyncWebCrawler) -> Set[str]:
+        """Process a single page and return new links."""
+        if url in self.crawled_urls or url in self.failed_urls:
+            return set()
+
+        try:
+            result = await crawler.arun(
+                url=url,
+                config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS),
+                session_id=str(time.time())
+            )
+
+            if result and result.success:
+                # Extract links before processing content
+                new_links = self.extract_links(url, result.html)
+                
+                # Process and save content
+                processed_content = await self.process_content(
+                    result.markdown_v2.raw_markdown, url)
+                self.save_markdown(url, processed_content)
+                
+                # Mark as crawled
+                self.crawled_urls.add(url)
+                print(f"✓ Processed: {url}")
+                
+                # Clear some memory
+                del result.html
+                del result.markdown_v2
+                gc.collect()
+                
+                return new_links
+            else:
+                self.failed_urls.add(url)
+                print(f"✗ Failed to process: {url}")
+                return set()
+                
+        except Exception as e:
+            self.failed_urls.add(url)
+            print(f"✗ Error processing {url}: {e}")
+            return set()
+
+    async def crawl_site(self, start_url: str):
+        print(f"Starting crawl from: {start_url}")
+        start_time = time.time()
+        
+        # Initialize URL set
+        self.to_crawl.add(start_url)
+        
+        try:
+            while self.to_crawl:
+                # Create a new crawler for each batch
+                crawler = AsyncWebCrawler(config=self.browser_config)
+                await crawler.start()
+                
+                try:
+                    # Process current batch
+                    current_batch = set(itertools.islice(self.to_crawl, self.max_concurrent))
+                    self.to_crawl -= current_batch
+                    
+                    # Create tasks for the batch
+                    tasks = [self.process_page(url, crawler) for url in current_batch]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Add new links to crawl
+                    for result in results:
+                        if isinstance(result, set):
+                            new_links = result - self.crawled_urls - self.failed_urls
+                            self.to_crawl.update(new_links)
+                    
+                    # Progress report
+                    print(f"\nProgress: {len(self.crawled_urls)} crawled, "
+                          f"{len(self.to_crawl)} pending, "
+                          f"{len(self.failed_urls)} failed")
+                    
+                finally:
+                    await crawler.close()
+                    gc.collect()  # Force garbage collection
+            
+            # Final report
+            end_time = time.time()
+            duration = end_time - start_time
+            
+            print("\nCrawl completed!")
+            print(f"Successfully crawled: {len(self.crawled_urls)} pages")
+            print(f"Failed to crawl: {len(self.failed_urls)} pages")
+            print(f"Total time: {duration:.2f} seconds")
+            if self.crawled_urls:
+                print(f"Average time per page: {duration/len(self.crawled_urls):.2f} seconds")
+            
+            if self.failed_urls:
+                print("\nFailed URLs:")
+                for url in self.failed_urls:
+                    print(f"- {url}")
+
+            self.ai_provider.print_stats()
+
+        except Exception as e:
+            print(f"Critical error during crawl: {e}")
+
+async def main():
+    parser = argparse.ArgumentParser(description='Memory-efficient multi-AI provider web crawler')
+    parser.add_argument('url', help='Starting URL to crawl')
+    parser.add_argument('--output-dir', default='crawled_docs', help='Output directory')
+    parser.add_argument('--max-concurrent', type=int, default=5, help='Maximum concurrent crawls')
+    parser.add_argument('--config', default='api-keys.json', help='API keys configuration file')
+    args = parser.parse_args()
+
+    try:
+        with open(args.config) as f:
+            api_keys = json.load(f)
+    except FileNotFoundError:
+        print(f"Config file {args.config} not found")
+        return
+
+    ai_provider = MultiAIProvider(api_keys)
+    crawler = FastSiteCrawler(args.output_dir, ai_provider, args.max_concurrent)
+    await crawler.crawl_site(args.url)
+
+if __name__ == "__main__":
+    asyncio.run(main())
